@@ -1,0 +1,149 @@
+# opensearch-cluster.yaml
+# Secure single-node OpenSearch cluster configuration with JWT authentication
+
+apiVersion: opensearch.opster.io/v1
+kind: OpenSearchCluster
+metadata:
+  name: opensearch-cluster
+  namespace: opensearch
+  annotations:
+    sidecar.istio.io/inject: "true"
+spec:
+  general:
+    httpPort: 9200
+    version: "2.11.1"
+    serviceName: opensearch-cluster
+    serviceAccount: opensearch-cluster
+    pluginsList: []
+    vendor: opensearch
+    drainDataTimeout: 300
+    
+  # OpenSearch Dashboards configuration
+  dashboards:
+    version: "2.11.1"
+    enable: true
+    replicas: 1
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+        add:
+          - CHOWN
+          - DAC_OVERRIDE
+          - SETGID
+          - SETUID
+    additionalConfig:
+      opensearch_security.auth.type: "jwt"
+      opensearch_security.jwt.header: "Authorization"
+      opensearch_security.jwt.url_parameter: ""
+      opensearch_security.jwt.roles_key: "roles"
+      opensearch_security.jwt.subject_key: "sub"
+      
+  # Node pool configuration - single node with all roles
+  nodePools:
+  - component: nodes
+    replicas: 1
+    diskSize: "5Gi"
+    nodeClass: ""
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi" 
+        cpu: "1000m"
+    roles:
+      - master
+      - ingest
+      - data
+      - remote_cluster_client
+    jvm: "-Xmx1g -Xms1g"
+    
+    # Security hardening
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+        add:
+          - CHOWN
+          - DAC_OVERRIDE
+          - SETGID
+          - SETUID
+          - NET_BIND_SERVICE
+    
+    # Persistence
+    persistence:
+      pvc:
+        storageClass: standard
+        accessModes:
+        - ReadWriteOnce
+        
+    # OpenSearch configuration with JWT security
+    additionalConfig:
+      cluster.name: "opensearch-cluster"
+      network.host: "0.0.0.0"
+      
+      # Security plugin configuration
+      plugins.security.ssl.http.enabled: false
+      plugins.security.disabled: false
+      plugins.security.allow_default_init_securityindex: true
+      
+      # Admin and node certificates
+      plugins.security.authcz.admin_dn:
+        - "CN=admin,OU=SSL,O=Test,L=Test,C=DE"
+      plugins.security.nodes_dn:
+        - "CN=opensearch-cluster,OU=SSL,O=Test,L=Test,C=DE"
+        
+      # Audit configuration
+      plugins.security.audit.type: "internal_opensearch"
+      plugins.security.enable_snapshot_restore_privilege: true
+      plugins.security.check_snapshot_restore_write_privileges: true
+      
+      # REST API roles
+      plugins.security.restapi.roles_enabled:
+        - "all_access"
+        - "security_rest_api_access"
+        
+      # System indices
+      plugins.security.system_indices.enabled: true
+      plugins.security.system_indices.indices:
+        - ".plugins-ml-*"
+        - ".opendistro-*"
+        - ".opensearch-*"
+        - ".ql-datasources"
+        - ".replication-metadata-store"
+        - ".geospatial-ip2geo-data*"
+        
+      # JWT Authentication Domain Configuration
+      plugins.security.authc.jwt_auth_domain.http_enabled: true
+      plugins.security.authc.jwt_auth_domain.transport_enabled: true
+      plugins.security.authc.jwt_auth_domain.order: 0
+      plugins.security.authc.jwt_auth_domain.http_authenticator.type: "jwt"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.challenge: false
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.signing_key: "my-secret-jwt-key-for-opensearch-authentication-change-this-in-production"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.jwt_header: "Authorization"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.jwt_url_parameter: ""
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.subject_key: "sub"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.roles_key: "roles"
+      plugins.security.authc.jwt_auth_domain.authentication_backend.type: "noop"

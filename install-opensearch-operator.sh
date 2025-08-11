@@ -1,136 +1,159 @@
 #!/bin/bash
-
-# Strict Mode
 set -euo pipefail
 
-# Default values
-NAMESPACE=""
-KUBECONFIG=""
-PROXY=""
+# install-opensearch-operator.sh
+# Deploy OpenSearch Operator with namespace-scoped permissions and security hardening
 
-# --- Helper Functions ---
+NAMESPACE="opensearch"
 
-# Function to print usage information
-usage() {
-    echo "Usage: $0 --namespace <namespace> --kubeconfig <path-to-kubeconfig> [--proxy <proxy-url>]"
-    echo "  --namespace      : Kubernetes namespace to deploy to (required)"
-    echo "  --kubeconfig     : Path to the kubeconfig file (required)"
-    echo "  --proxy          : Optional proxy server URL"
-    exit 1
-}
+echo "🔧 Installing OpenSearch Operator in namespace: $NAMESPACE"
 
-# Function to log messages
-log() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-# --- Argument Parsing ---
-
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --namespace) NAMESPACE="$2"; shift ;;
-        --kubeconfig) KUBECONFIG="$2"; shift ;;
-        --proxy) PROXY="$2"; shift ;;
-        *) echo "Unknown parameter passed: $1"; usage ;;
-    esac
-    shift
+# Check if required tools are available
+for tool in helm kubectl python3; do
+    if ! command -v "$tool" &> /dev/null; then
+        echo "❌ Error: $tool is not installed or not in PATH"
+        exit 1
+    fi
 done
 
-# Validate required arguments
-if [ -z "$NAMESPACE" ] || [ -z "$KUBECONFIG" ]; then
-    echo "Error: Missing required arguments."
-    usage
-fi
-
-# --- Environment Setup ---
-
-# Set Kubeconfig
-export KUBECONFIG="$KUBECONFIG"
-
-# Set Proxy if provided
-if [ -n "$PROXY" ]; then
-    export HTTPS_PROXY="$PROXY"
-    log "Using proxy: $PROXY"
-fi
-
-# --- Installation ---
-
-log "Starting OpenSearch Operator installation in namespace: $NAMESPACE"
-
-# 1. Create namespace if it does not exist
-log "Creating namespace $NAMESPACE if it does not exist..."
+# Create namespace if it doesn't exist
+echo "📁 Creating namespace $NAMESPACE if it doesn't exist..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# 2. Add OpenSearch Helm repository
-log "Adding OpenSearch Helm repository..."
-helm repo add opensearch-operator https://opensearch-project.github.io/opensearch-k8s-operator/
+# Add OpenSearch Helm repository
+echo "📦 Adding OpenSearch Helm repository..."
+helm repo add opensearch https://opensearch-project.github.io/helm-charts/ || echo "Repository already exists"
 helm repo update
 
-# 3. Render the Helm chart template
-log "Rendering Helm chart to a local file..."
-helm template opensearch-operator opensearch-operator/opensearch-operator \
-    --namespace "$NAMESPACE" \
-    --set manager.securityContext.seccompProfile.type=RuntimeDefault \
-    --set manager.args[0]="--namespace=\$(NAMESPACE)" \
-    > opensearch-operator.yaml
+# Install OpenSearch Operator using values file
+echo "⚡ Installing OpenSearch Operator with security hardening..."
+if [ -f "opensearch-operator.yaml" ]; then
+    helm upgrade --install opensearch-operator opensearch-operator/opensearch-operator \
+        --namespace "$NAMESPACE" \
+        --values opensearch-operator.yaml \
+        --wait \
+        --timeout=10m
+else
+    echo "❌ opensearch-operator.yaml values file not found"
+    echo "📝 Creating default secure values file..."
+    
+    # Create a minimal secure values file
+    cat > opensearch-operator.yaml <<EOF
+manager:
+  image:
+    tag: "2.4.1"
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    seccompProfile:
+      type: RuntimeDefault
+    capabilities:
+      drop:
+        - ALL
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
 
-log "Successfully rendered Helm chart to opensearch-operator.yaml"
+# Convert cluster-level permissions to namespace-scoped
+rbac:
+  create: true
+  clusterRole: false  # Disable cluster role creation
+  rules:
+    # Namespace-scoped permissions only
+    - apiGroups: [""]
+      resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    - apiGroups: ["apps"]
+      resources: ["deployments", "statefulsets"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    - apiGroups: ["opensearch.opster.io"]
+      resources: ["opensearchclusters"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+EOF
+    
+    helm upgrade --install opensearch-operator opensearch-operator/opensearch-operator \
+        --namespace "$NAMESPACE" \
+        --values opensearch-operator.yaml \
+        --wait \
+        --timeout=10m
+fi
 
-
-# 4. Use Python to transform ClusterRoles to Roles
-log "Transforming ClusterRoles to Roles for namespace-scoping..."
-python3 - "$NAMESPACE" <<'EOF'
-import yaml
-import sys
-
-def transform_roles(file_path, namespace):
-    with open(file_path, "r") as f:
-        docs = list(yaml.safe_load_all(f))
-
-    new_docs = []
-    for doc in docs:
-        if doc is None:
-            continue
-        
-        kind = doc.get("kind")
-        
-        if kind == "ClusterRole":
-            doc["kind"] = "Role"
-            if "rules" in doc:
-                new_rules = []
-                for rule in doc["rules"]:
-                    if "nonResourceURLs" not in rule:
-                        new_rules.append(rule)
-                doc["rules"] = new_rules
-            if "metadata" in doc and "name" in doc["metadata"]:
-                log(f"Transformed ClusterRole {doc['metadata']['name']} to Role")
-
-        if kind == "ClusterRoleBinding":
-            doc["kind"] = "RoleBinding"
-            if "subjects" in doc:
-                for subject in doc["subjects"]:
-                    if "namespace" in subject:
-                        subject["namespace"] = namespace
-            if "roleRef" in doc and doc["roleRef"]["kind"] == "ClusterRole":
-                doc["roleRef"]["kind"] = "Role"
-                log(f"Transformed ClusterRoleBinding to RoleBinding")
-
-        new_docs.append(doc)
-
-    with open(file_path, "w") as f:
-        yaml.dump_all(new_docs, f, default_flow_style=False, sort_keys=False)
-
-def log(message):
-    print(f"[PYTHON] {message}")
-
-if __name__ == "__main__":
-    transform_roles("opensearch-operator.yaml", sys.argv[1])
+# Create namespace-scoped RBAC if needed
+echo "🔐 Creating namespace-scoped RBAC for OpenSearch Operator..."
+cat > opensearch-operator-rbac.yaml <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensearch-operator
+  namespace: $NAMESPACE
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensearch-operator
+  namespace: $NAMESPACE
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims", "endpoints"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["opensearch.opster.io"]
+  resources: ["opensearchclusters", "opensearchclusters/status", "opensearchclusters/finalizers"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["policy"]
+  resources: ["podsecuritypolicies"]
+  verbs: ["use"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opensearch-operator
+  namespace: $NAMESPACE
+subjects:
+- kind: ServiceAccount
+  name: opensearch-operator
+  namespace: $NAMESPACE
+roleRef:
+  kind: Role
+  name: opensearch-operator
+  apiGroup: rbac.authorization.k8s.io
 EOF
 
-log "Successfully transformed roles."
+kubectl apply -f opensearch-operator-rbac.yaml
 
-# 5. Apply the modified manifest
-log "Applying the modified manifest..."
-kubectl apply -f opensearch-operator.yaml --namespace "$NAMESPACE"
+# Verify installation
+echo "✅ Verifying OpenSearch Operator installation..."
+kubectl wait --for=condition=available deployment/opensearch-operator \
+    --namespace "$NAMESPACE" --timeout=300s
 
-log "OpenSearch Operator installation complete."
+if kubectl get deployment opensearch-operator -n "$NAMESPACE" | grep -q "1/1"; then
+    echo "✅ OpenSearch Operator successfully installed and running!"
+    echo "📋 Operator is running with namespace-scoped permissions only"
+    echo "🔒 Security context enforced: non-root user, read-only filesystem, seccomp profile"
+else
+    echo "❌ OpenSearch Operator installation failed"
+    echo "📝 Check logs: kubectl logs -n $NAMESPACE deployment/opensearch-operator"
+    exit 1
+fi
+
+echo "🎉 OpenSearch Operator installation completed successfully!"

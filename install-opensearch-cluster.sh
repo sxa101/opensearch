@@ -1,198 +1,209 @@
 #!/bin/bash
-
-# Strict Mode
 set -euo pipefail
 
-# Default values
-NAMESPACE=""
-KUBECONFIG=""
-PROXY=""
-ISTIO_INJECTION="disabled"
+# install-opensearch-cluster.sh
+# Deploy single-node OpenSearch cluster with JWT authentication and security hardening
 
-# --- Helper Functions ---
+NAMESPACE="opensearch"
+JWT_SECRET="my-secret-jwt-key-for-opensearch-authentication-change-this-in-production"
 
-# Function to print usage information
-usage() {
-    echo "Usage: $0 --namespace <namespace> --kubeconfig <path-to-kubeconfig> [--proxy <proxy-url>] [--istio-injection <enabled|disabled>]"
-    echo "  --namespace        : Kubernetes namespace to deploy to (required)"
-    echo "  --kubeconfig       : Path to the kubeconfig file (required)"
-    echo "  --proxy            : Optional proxy server URL"
-    echo "  --istio-injection  : Optional: enable istio sidecar injection. Defaults to disabled"
-    exit 1
-}
+echo "🔧 Installing OpenSearch Cluster in namespace: $NAMESPACE"
 
-# Function to log messages
-log() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-# --- Argument Parsing ---
-
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --namespace) NAMESPACE="$2"; shift ;;
-        --kubeconfig) KUBECONFIG="$2"; shift ;;
-        --proxy) PROXY="$2"; shift ;;
-        --istio-injection) ISTIO_INJECTION="$2"; shift ;;
-        *) echo "Unknown parameter passed: $1"; usage ;;
-    esac
-    shift
+# Check if required tools are available
+for tool in helm kubectl openssl; do
+    if ! command -v "$tool" &> /dev/null; then
+        echo "❌ Error: $tool is not installed or not in PATH"
+        exit 1
+    fi
 done
 
-# Validate required arguments
-if [ -z "$NAMESPACE" ] || [ -z "$KUBECONFIG" ]; then
-    echo "Error: Missing required arguments."
-    usage
-fi
-
-# --- Environment Setup ---
-
-# Set Kubeconfig
-export KUBECONFIG="$KUBECONFIG"
-
-# Set Proxy if provided
-if [ -n "$PROXY" ]; then
-    export HTTPS_PROXY="$PROXY"
-    log "Using proxy: $PROXY"
-fi
-
-# --- Installation ---
-
-log "Starting OpenSearch Cluster installation in namespace: $NAMESPACE"
-
-# 0. Create namespace if it doesn't exist
-log "Ensuring namespace '$NAMESPACE' exists..."
+# Ensure namespace exists
+echo "📁 Ensuring namespace $NAMESPACE exists..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-# Prerequisite check reminder
-log "IMPORTANT: This script assumes the OpenSearch Operator and Istio are already installed in your cluster."
-log "IMPORTANT: The default StorageClass 'standard' is used. Ensure it exists or update the opensearch-cluster.yaml."
+# Label namespace for Istio injection
+kubectl label namespace "$NAMESPACE" istio-injection=enabled --overwrite
 
-# 1. Create the opensearch-cluster.yaml from a template
-log "Creating opensearch-cluster.yaml..."
-cat > opensearch-cluster.yaml <<EOF
+echo "⚠️  Prerequisites check:"
+echo "   - OpenSearch CRDs must be installed (run install-opensearch-crds.sh first)"
+echo "   - OpenSearch Operator must be running (run install-opensearch-operator.sh first)"
+echo "   - Istio must be installed in the cluster"
+
+# Create JWT signing key secret
+echo "🔐 Creating JWT signing key secret..."
+kubectl create secret generic opensearch-jwt-secret \
+    --from-literal=key="$JWT_SECRET" \
+    --namespace "$NAMESPACE" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+# Deploy OpenSearch Cluster using values file
+echo "⚡ Deploying OpenSearch Cluster with security hardening..."
+if [ -f "opensearch-cluster.yaml" ]; then
+    kubectl apply -f opensearch-cluster.yaml --namespace "$NAMESPACE"
+else
+    echo "📝 Creating secure OpenSearch cluster manifest..."
+    cat > opensearch-cluster-manifest.yaml <<EOF
 apiVersion: opensearch.opster.io/v1
 kind: OpenSearchCluster
 metadata:
-  name: my-cluster
+  name: opensearch-cluster
   namespace: $NAMESPACE
   annotations:
-    "sidecar.istio.io/inject": "$ISTIO_INJECTION"
+    sidecar.istio.io/inject: "true"
 spec:
   general:
-    version: 2.4.1
-    serviceName: my-cluster
-  nodePools:
-  - component: master
+    httpPort: 9200
+    version: "2.11.1"
+    serviceName: opensearch-cluster
+    serviceAccount: opensearch-cluster
+    pluginsList: []
+    vendor: opensearch
+    drainDataTimeout: 300
+  dashboards:
+    version: "2.11.1"
+    enable: true
     replicas: 1
-    diskSize: "1Gi"
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+    additionalConfig:
+      opensearch_security.auth.type: jwt
+      opensearch_security.jwt.header: Authorization
+      opensearch_security.jwt.url_parameter: ""
+      opensearch_security.jwt.roles_key: roles
+      opensearch_security.jwt.subject_key: sub
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+        add:
+          - CHOWN
+          - DAC_OVERRIDE
+          - SETGID
+          - SETUID
+  nodePools:
+  - component: nodes
+    replicas: 1
+    diskSize: "5Gi"
+    nodeClass: ""
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+    roles:
+      - master
+      - ingest
+      - data
+      - remote_cluster_client
+    jvm: "-Xmx1g -Xms1g"
+    additionalConfig:
+      cluster.name: opensearch-cluster
+      network.host: "0.0.0.0"
+      plugins.security.ssl.http.enabled: false
+      plugins.security.disabled: false
+      plugins.security.allow_default_init_securityindex: true
+      plugins.security.authcz.admin_dn:
+        - "CN=admin,OU=SSL,O=Test,L=Test,C=DE"
+      plugins.security.nodes_dn:
+        - "CN=opensearch-cluster,OU=SSL,O=Test,L=Test,C=DE"
+      plugins.security.audit.type: internal_opensearch
+      plugins.security.enable_snapshot_restore_privilege: true
+      plugins.security.check_snapshot_restore_write_privileges: true
+      plugins.security.restapi.roles_enabled:
+        - "all_access"
+        - "security_rest_api_access"
+      plugins.security.system_indices.enabled: true
+      plugins.security.system_indices.indices:
+        - ".plugins-ml-config"
+        - ".plugins-ml-connector"
+        - ".plugins-ml-model-group"
+        - ".plugins-ml-model"
+        - ".plugins-ml-task"
+        - ".plugins-ml-conversation-meta"
+        - ".plugins-ml-conversation-interactions"
+        - ".plugins-ml-memory-meta"
+        - ".plugins-ml-memory-message"
+        - ".plugins-ml-stop-words"
+        - ".opendistro-alerting-config"
+        - ".opendistro-alerting-alert*"
+        - ".opendistro-anomaly-results*"
+        - ".opendistro-anomaly-detector*"
+        - ".opendistro-anomaly-checkpoints"
+        - ".opendistro-anomaly-detection-state"
+        - ".opendistro-reports-*"
+        - ".opensearch-notifications-*"
+        - ".opensearch-notebooks"
+        - ".opensearch-observability"
+        - ".ql-datasources"
+        - ".opendistro-asynchronous-search-response*"
+        - ".replication-metadata-store"
+        - ".opensearch-knn-models"
+        - ".geospatial-ip2geo-data*"
+        - ".plugins-flow-framework-config"
+        - ".plugins-flow-framework-templates"
+        - ".plugins-flow-framework-state"
+      # JWT Authentication Configuration
+      plugins.security.authc.jwt_auth_domain.http_enabled: true
+      plugins.security.authc.jwt_auth_domain.transport_enabled: true
+      plugins.security.authc.jwt_auth_domain.order: 0
+      plugins.security.authc.jwt_auth_domain.http_authenticator.type: jwt
+      plugins.security.authc.jwt_auth_domain.http_authenticator.challenge: false
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.signing_key: "$JWT_SECRET"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.jwt_header: "Authorization"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.jwt_url_parameter: ""
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.subject_key: "sub"
+      plugins.security.authc.jwt_auth_domain.http_authenticator.config.roles_key: "roles"
+      plugins.security.authc.jwt_auth_domain.authentication_backend.type: noop
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+          - ALL
+        add:
+          - CHOWN
+          - DAC_OVERRIDE
+          - SETGID
+          - SETUID
+          - NET_BIND_SERVICE
     persistence:
       pvc:
         storageClass: standard
         accessModes:
         - ReadWriteOnce
-    roles:
-      - master
-    resources:
-      requests:
-        cpu: "1"
-        memory: "1Gi"
-      limits:
-        cpu: "1"
-        memory: "1Gi"
 EOF
 
-log "opensearch-cluster.yaml created successfully."
+    kubectl apply -f opensearch-cluster-manifest.yaml
+fi
 
-# 2. Apply the cluster manifest
-log "Applying the OpenSearch cluster manifest..."
-kubectl apply -f opensearch-cluster.yaml --namespace "$NAMESPACE"
+# Wait for cluster to be ready
+echo "⏳ Waiting for OpenSearch cluster to be ready..."
+kubectl wait --for=condition=Ready pod -l component=opensearch-cluster \
+    --namespace "$NAMESPACE" --timeout=600s
 
-# 3. Create Istio Gateway
-log "Creating Istio Gateway..."
-cat > istio-gateway.yaml <<EOF
-apiVersion: networking.istio.io/v1beta1
-kind: Gateway
-metadata:
-  name: opensearch-gateway
-  namespace: $NAMESPACE
-spec:
-  selector:
-    istio: ingressgateway # Use the default Istio ingress gateway
-  servers:
-  - port:
-      number: 443
-      name: https
-      protocol: HTTPS
-    tls:
-      mode: SIMPLE
-      credentialName: opensearch-credential # IMPORTANT: You must create this secret with your TLS certificate!
-    hosts:
-    - "opensearch.$NAMESPACE.example.com"
-EOF
-
-kubectl apply -f istio-gateway.yaml --namespace "$NAMESPACE"
-
-# 4. Create Istio VirtualService
-log "Creating Istio VirtualService..."
-cat > istio-virtualservice.yaml <<EOF
-apiVersion: networking.istio.io/v1beta1
-kind: VirtualService
-metadata:
-  name: opensearch-vs
-  namespace: $NAMESPACE
-spec:
-  hosts:
-  - "opensearch.$NAMESPACE.example.com"
-  gateways:
-  - opensearch-gateway
-  http:
-  - match:
-    - uri:
-        prefix: /
-    route:
-    - destination:
-        host: my-cluster.$NAMESPACE.svc.cluster.local
-        port:
-          number: 9200
-EOF
-
-kubectl apply -f istio-virtualservice.yaml --namespace "$NAMESPACE"
-
-# 5. Create Istio DestinationRule
-log "Creating Istio DestinationRule..."
-cat > istio-destinationrule.yaml <<EOF
-apiVersion: networking.istio.io/v1beta1
-kind: DestinationRule
-metadata:
-  name: opensearch-dr
-  namespace: $NAMESPACE
-spec:
-  host: my-cluster.$NAMESPACE.svc.cluster.local
-EOF
-
-kubectl apply -f istio-destinationrule.yaml --namespace "$NAMESPACE"
-
-# 6. Create Istio PeerAuthentication
-log "Creating Istio PeerAuthentication policy..."
-cat > istio-peerauth.yaml <<EOF
-apiVersion: security.istio.io/v1beta1
-kind: PeerAuthentication
-metadata:
-  name: opensearch-peerauth
-  namespace: $NAMESPACE
-spec:
-  selector:
-    matchLabels:
-      opensearch.opster.io/cluster-name: my-cluster
-  mtls:
-    mode: STRICT
-EOF
-
-kubectl apply -f istio-peerauth.yaml --namespace "$NAMESPACE"
-
-log "OpenSearch Cluster installation complete."
-log "The cluster will be provisioned by the OpenSearch Operator."
-log "Monitor the status with: kubectl get opensearchcluster -n $NAMESPACE -w"
-log "Istio Gateway, VirtualService, DestinationRule, and PeerAuthentication policy created for ingress and security."
-log "To access OpenSearch from outside the cluster, ensure you have a secret named 'opensearch-credential' and have configured DNS for 'opensearch.$NAMESPACE.example.com' to point to your Istio Ingress Gateway."
+echo "✅ OpenSearch Cluster deployment completed!"
+echo "📋 Cluster Status:"
+kubectl get opensearchcluster -n "$NAMESPACE"
+echo ""
+echo "🔒 JWT Authentication is enabled with shared secret"
+echo "📝 Use generate-test-jwt.sh to create test tokens"
+echo "🌐 Apply Istio manifests for external access"
